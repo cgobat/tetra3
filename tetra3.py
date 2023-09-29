@@ -357,7 +357,7 @@ class Tetra3():
     @property
     def has_database(self):
         """bool: True if a database is loaded."""
-        return not (self._star_table is None or self._pattern_catalog is None)
+        return self._star_table is not None and self._pattern_catalog is not None
 
     @property
     def star_table(self):
@@ -437,8 +437,12 @@ class Tetra3():
         """
         self._logger.debug('Got load database with: ' + str(path))
         if isinstance(path, str):
-            self._logger.debug('String given, append to tetra3 directory')
-            path = (Path(__file__).parent / path).with_suffix('.npz')
+            if Path(path).is_absolute():
+                self._logger.debug('Absolute path given, use as-is')
+                path = Path(path)
+            else:
+                self._logger.debug('Relative path given, append to tetra3 directory')
+                path = (Path(__file__).parent / path).with_suffix('.npz')
         else:
             self._logger.debug('Not a string, use as path directly')
             path = Path(path).with_suffix('.npz')
@@ -641,7 +645,7 @@ class Tetra3():
         verification_stars_per_fov = int(verification_stars_per_fov)
         star_max_magnitude = float(star_max_magnitude)
         pattern_size = 4
-        pattern_bins = round(1/4/pattern_max_error)
+        pattern_bins = round(0.25/pattern_max_error)
         current_year = datetime.utcnow().year
         presort_patterns = bool(presort_patterns)
         save_largest_edge = bool(save_largest_edge)
@@ -651,7 +655,7 @@ class Tetra3():
         if star_catalog in ('hip_main', 'tyc_main') and not catalog_file_full_pathname.suffix:
             catalog_file_full_pathname = catalog_file_full_pathname.with_suffix('.dat')
         
-        assert catalog_file_full_pathname.exists(), 'No star catalogue found at ' +str(     catalog_file_full_pathname)   
+        assert catalog_file_full_pathname.exists(), 'No star catalogue found at ' +str(catalog_file_full_pathname)   
         
         # Calculate number of star catalog entries:
         if star_catalog == 'bsc5':
@@ -676,17 +680,40 @@ class Tetra3():
 
         # Read magnitude, RA, and Dec from star catalog:
         if star_catalog == 'bsc5':
-            bsc5_data_type = [('ID', np.float32), ('RA1950', np.float64),
-                              ('Dec1950', np.float64), ('type', np.int16),
-                              ('mag', np.int16), ('RA_pm', np.float32), ('Dec_PM', np.float32)]            
             with open(catalog_file_full_pathname, 'rb') as star_catalog_file:
-                star_catalog_file.seek(header_length)  # skip header
-                reader = np.fromfile(star_catalog_file, dtype=bsc5_data_type, count=num_entries)
+                header = dict(zip(["STAR0", "STAR1", "STARN", "STNUM",
+                                   "MPROP", "NMAG", "NBENT"],
+                                  np.frombuffer(star_catalog_file.read(header_length),
+                                                dtype=np.int32)))
+                self._logger.debug(f"BSC5 header: {header}")
+                coord_epoch = "J2000" if header['NMAG']<0 else "B1950"
+                self._logger.debug(f"NMAG{'<' if header['NMAG']<0 else '>='}0 indicates that"
+                                   f" coordinates are {coord_epoch}")
+                if header["STNUM"] < 1:
+                    bsc5_format = []
+                else:
+                    bsc5_format = [("XNO", (np.int32 if header["STNUM"]==4 else np.float32))]
+                bsc5_format += [('SRA0', np.float64), ('SDEC0', np.float64),
+                                   ('ISP', "S2"), ('MAG', np.int16, abs(header["NMAG"]))]
+                if header["MPROP"]:
+                    bsc5_format += [('XRPM', np.float32), ('XDPM', np.float32)]
+                    if header["MPROP"] == 2:
+                        bsc5_format.append(("SVEL", np.int64))
+                if header["STNUM"] < 0:
+                    bsc5_format.append(("NAME", f"S{-header['STNUM']}"))
+                bsc5_data_type = np.dtype(bsc5_format)
+                self._logger.debug(f"constructed dtype: {bsc5_data_type}")
+                assert header["NBENT"] == bsc5_data_type.itemsize, \
+                                          ("dtype construction problem: header claims "
+                                           f"{header['NBENT']}B per entry, dtype size is "
+                                           f"{bsc5_data_type.itemsize}B")
+                reader = np.fromfile(star_catalog_file, dtype=bsc5_data_type,
+                                     count=abs(header["STARN"]))
                 for (i, entry) in enumerate(reader):  # star_num in range(num_entries):
                     mag = entry[4]/100
                     if mag <= star_max_magnitude:
-                        ra  = entry[1] + entry[5] * (current_year - 1950)
-                        dec = entry[2] + entry[6] * (current_year - 1950)
+                        ra  = entry[1] + entry[5] * (current_year - float(coord_epoch.lstrip("JB")))
+                        dec = entry[2] + entry[6] * (current_year - float(coord_epoch.lstrip("JB")))
                         star_table[i,:] = ([ra, dec, 0, 0, 0, mag])
                         star_catID[i] = np.uint16(entry[0])
         elif star_catalog in ('hip_main', 'tyc_main'):
@@ -1074,7 +1101,7 @@ class Tetra3():
         # Add extraction time to results and return
         solution['T_extract'] = t_extract
         if isinstance(centr_data, tuple):
-            return (solution,) + centr_data[1:]
+            return (solution, *centr_data[1:])
         else:
             return solution
 
