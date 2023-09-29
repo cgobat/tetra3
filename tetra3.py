@@ -108,7 +108,7 @@ from scipy.spatial.distance import pdist, cdist
 from PIL import Image, ImageDraw
 
 _MAGIC_RAND = 2654435761
-_supported_databases = ('bsc5', 'hip_main', 'tyc_main')
+_supported_databases = ('bsc5', 'bsc5_ascii', 'hip_main', 'tyc_main')
 
 def _insert_at_index(item, index, table):
     """Inserts to table with quadratic probing."""
@@ -708,7 +708,7 @@ class Tetra3():
                             width = int(fmt.split(".")[0][1:])
                             field_widths.append(width)
                             field_types.append({"I": (np.int8 if width<3 else np.int16 if width<5 else np.int32 if width<10 else int),
-                                                "F": np.float32, "A": str}[fmt[0]])
+                                                "F": np.float32, "A": f"U{width}"}[fmt[0]])
                             field_names.append(label)
                     readme_path.unlink()
         
@@ -768,20 +768,20 @@ class Tetra3():
                 mag = (reader["MAG"]/100.).squeeze()
                 ra = reader["SRA0"] + reader["XRPM"] * (current_year - float(coord_epoch.lstrip("JB")))
                 dec = reader["SDEC0"] + reader["XDPM"] * (current_year - float(coord_epoch.lstrip("JB")))
-                star_table[mag<=star_max_magnitude, 0] = ra.squeeze()[mag<=star_max_magnitude]
-                star_table[mag<=star_max_magnitude, 1] = dec.squeeze()[mag<=star_max_magnitude]
+                star_table[mag<=star_max_magnitude, 0] =  ra[mag<=star_max_magnitude]
+                star_table[mag<=star_max_magnitude, 1] = dec[mag<=star_max_magnitude]
                 star_table[mag<=star_max_magnitude, 5] = mag[mag<=star_max_magnitude]
-                star_catID[mag<=star_max_magnitude] = reader["XNO"].squeeze()[mag<=star_max_magnitude]
+                star_catID[mag<=star_max_magnitude] = reader["XNO"][mag<=star_max_magnitude]
         elif star_catalog == "bsc5_ascii":
             arr = np.genfromtxt(catalog_file_full_pathname, names=field_names, deletechars=" ",
                                 delimiter=field_widths, dtype=field_types)
             mag = arr["Vmag"]
-            ra = arr["RAh"]*360./24 + arr["RAm"]*60./24 + arr["RAs"]/24
+            ra = arr["RAh"]*15. + arr["RAm"]*0.25 + arr["RAs"]*0.25/60 # convert H:M:S to decimal deg
             ra += arr["pmRA"] * (current_year - 2000.0)
             dec = arr["DEd"] + arr["DEm"]/60. + arr["DEs"]/3600.
-            dec *= np.where(arr["DE-"]=="-", -1, 1) # TODO: fix
+            dec *= np.where(arr["DE-"]=="-", -1, 1)
             dec += arr["pmDE"] * (current_year - 2000.0)
-            star_table[:, 0] = ra; star_table[:, 1] = dec; star_table[:, 2:5] = 0; star_table[:, 5] = mag
+            star_table[:, 0] = np.deg2rad(ra); star_table[:, 1] = np.deg2rad(dec); star_table[:, 2:5] = 0; star_table[:, 5] = mag
             star_catID[:] = arr["HR"]
         elif star_catalog in ('hip_main', 'tyc_main'):
             incomplete_entries = 0
