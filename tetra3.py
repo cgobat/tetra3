@@ -655,7 +655,25 @@ class Tetra3():
         if star_catalog in ('hip_main', 'tyc_main') and not catalog_file_full_pathname.suffix:
             catalog_file_full_pathname = catalog_file_full_pathname.with_suffix('.dat')
         
-        assert catalog_file_full_pathname.exists(), 'No star catalogue found at ' +str(catalog_file_full_pathname)   
+        try:
+            assert catalog_file_full_pathname.exists(), 'No star catalogue found at '+str(catalog_file_full_pathname)
+        except AssertionError:
+            if star_catalog == "bsc5":
+                import requests
+                self._logger.debug("Attempting to retrieve BSC5 catalog with GET request")
+                catalog_repsonse = requests.get("http://tdc-www.harvard.edu/catalogs/BSC5")
+                with open(catalog_file_full_pathname, "wb+") as local_catalog:
+                    local_catalog.write(catalog_repsonse.content)
+            elif star_catalog == "bsc5_ascii":
+                ... # not implemented
+            else: # hip_main or tyc_main
+                from ftplib import FTP
+                self._logger.debug(f"Attempting to retrieve {star_catalog} catalog via FTP")
+                cds_ftp = FTP(host="cdsarc.u-strasbg.fr")
+                cds_ftp.login()
+                cds_ftp.cwd("cats/I/239/")
+                with open(catalog_file_full_pathname, "wb+") as local_file:
+                    cds_ftp.retrbinary(f"RETR {star_catalog}.dat", local_file.write)
         
         # Calculate number of star catalog entries:
         if star_catalog == 'bsc5':
@@ -681,8 +699,8 @@ class Tetra3():
         # Read magnitude, RA, and Dec from star catalog:
         if star_catalog == 'bsc5':
             with open(catalog_file_full_pathname, 'rb') as star_catalog_file:
-                header = dict(zip(["STAR0", "STAR1", "STARN", "STNUM",
-                                   "MPROP", "NMAG", "NBENT"],
+                # see http://tdc-www.harvard.edu/catalogs/catalogsb.html for data format details
+                header = dict(zip(["STAR0", "STAR1", "STARN", "STNUM", "MPROP", "NMAG", "NBENT"],
                                   np.frombuffer(star_catalog_file.read(header_length),
                                                 dtype=np.int32)))
                 self._logger.debug(f"BSC5 header: {header}")
@@ -694,7 +712,7 @@ class Tetra3():
                 else:
                     bsc5_format = [("XNO", (np.int32 if header["STNUM"]==4 else np.float32))]
                 bsc5_format += [('SRA0', np.float64), ('SDEC0', np.float64),
-                                   ('ISP', "S2"), ('MAG', np.int16, abs(header["NMAG"]))]
+                                ('ISP', "S2"), ('MAG', np.int16, (abs(header["NMAG"]),))]
                 if header["MPROP"]:
                     bsc5_format += [('XRPM', np.float32), ('XDPM', np.float32)]
                     if header["MPROP"] == 2:
@@ -705,17 +723,19 @@ class Tetra3():
                 self._logger.debug(f"constructed dtype: {bsc5_data_type}")
                 assert header["NBENT"] == bsc5_data_type.itemsize, \
                                           ("dtype construction problem: header claims "
-                                           f"{header['NBENT']}B per entry, dtype size is "
-                                           f"{bsc5_data_type.itemsize}B")
-                reader = np.fromfile(star_catalog_file, dtype=bsc5_data_type,
-                                     count=abs(header["STARN"]))
-                for (i, entry) in enumerate(reader):  # star_num in range(num_entries):
-                    mag = entry[4]/100
-                    if mag <= star_max_magnitude:
-                        ra  = entry[1] + entry[5] * (current_year - float(coord_epoch.lstrip("JB")))
-                        dec = entry[2] + entry[6] * (current_year - float(coord_epoch.lstrip("JB")))
-                        star_table[i,:] = ([ra, dec, 0, 0, 0, mag])
-                        star_catID[i] = np.uint16(entry[0])
+                                           f"{header['NBENT']}B per entry, dtype itemsize"
+                                           f" is {bsc5_data_type.itemsize}B")
+                reader = np.fromfile(star_catalog_file, dtype=bsc5_data_type)
+                assert reader.shape[0] == abs(header["STARN"]), ("Catalog size mismatch: expected "
+                                                                 f"{abs(header['STARN'])} entries,"
+                                                                 f" got {reader.shape[0]}")
+                mag = (reader["MAG"]/100.).squeeze()
+                ra = reader["SRA0"] + reader["XRPM"] * (current_year - float(coord_epoch.lstrip("JB")))
+                dec = reader["SDEC0"] + reader["XDPM"] * (current_year - float(coord_epoch.lstrip("JB")))
+                star_table[mag<=star_max_magnitude, 0] = ra.squeeze()[mag<=star_max_magnitude]
+                star_table[mag<=star_max_magnitude, 1] = dec.squeeze()[mag<=star_max_magnitude]
+                star_table[mag<=star_max_magnitude, 5] = mag[mag<=star_max_magnitude]
+                star_catID[mag<=star_max_magnitude] = reader["XNO"].squeeze()[mag<=star_max_magnitude]
         elif star_catalog in ('hip_main', 'tyc_main'):
             incomplete_entries = 0
             with open(catalog_file_full_pathname, 'r') as star_catalog_file:
