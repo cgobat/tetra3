@@ -664,19 +664,56 @@ class Tetra3():
                 catalog_repsonse = requests.get("http://tdc-www.harvard.edu/catalogs/BSC5")
                 with open(catalog_file_full_pathname, "wb+") as local_catalog:
                     local_catalog.write(catalog_repsonse.content)
-            elif star_catalog == "bsc5_ascii":
-                ... # not implemented
-            else: # hip_main or tyc_main
+            else: # hip_main, tyc_main, or bsc5_ascii
                 from ftplib import FTP
                 self._logger.debug(f"Attempting to retrieve {star_catalog} catalog via FTP")
                 cds_ftp = FTP(host="cdsarc.u-strasbg.fr")
                 cds_ftp.login()
-                cds_ftp.cwd("cats/I/239/")
-                with open(catalog_file_full_pathname, "wb+") as local_file:
-                    cds_ftp.retrbinary(f"RETR {star_catalog}.dat", local_file.write)
+                if star_catalog in ("tyc_main", "hip_main"):
+                    cds_ftp.cwd("cats/I/239/")
+                    with open(catalog_file_full_pathname, "wb+") as local_file:
+                        cds_ftp.retrbinary(f"RETR {star_catalog}.dat", local_file.write)
+                elif star_catalog == "bsc5_ascii":
+                    cds_ftp.cwd("cats/V/50")
+                    local_gz_path = catalog_file_full_pathname.with_suffix(".gz")
+                    with open(local_gz_path, "wb+") as local_file:
+                        cds_ftp.retrbinary("RETR catalog.gz", local_file.write)
+                    import gzip
+                    with gzip.open(local_gz_path, "rb") as compressed:
+                        catalog_file_full_pathname = local_gz_path.parent/"bsc5_ascii.dat"
+                        with open(catalog_file_full_pathname, "wb+") as uncompressed:
+                            uncompressed.write(compressed.read())
+                    local_gz_path.unlink() # delete interim .gz file
+                    readme_path = catalog_file_full_pathname.parent / "bsc5_readme"
+                    if not readme_path.exists():
+                        with open(readme_path, "wb+") as specfile:
+                            cds_ftp.retrbinary("RETR ReadMe", specfile.write)
+                    with open(readme_path, "r") as specfile:
+                        field_widths = []
+                        field_types = []
+                        field_names = []
+                        file_contents = specfile.read()
+                        tbl_start = file_contents.index("   Bytes Format  Units   Label    Explanations") + \
+                                    len("   Bytes Format  Units   Label    Explanations") + 82
+                        specfile.seek(tbl_start, 0)
+                        for line in specfile.readlines():
+                            if line.startswith("-"):
+                                break
+                            fmt = line[10:14]
+                            if fmt.isspace():
+                                continue
+                            label = line[24:33].strip()
+                            if " " in label:
+                                label = label.split()[-1]
+                            width = int(fmt.split(".")[0][1:])
+                            field_widths.append(width)
+                            field_types.append({"I": (np.int8 if width<3 else np.int16 if width<5 else np.int32 if width<10 else int),
+                                                "F": np.float32, "A": str}[fmt[0]])
+                            field_names.append(label)
+                    readme_path.unlink()
         
         # Calculate number of star catalog entries:
-        if star_catalog == 'bsc5':
+        if star_catalog.startswith('bsc5'):
             header_length = 28
             num_entries = 9110
         elif star_catalog in ('hip_main', 'tyc_main'):
@@ -684,12 +721,12 @@ class Tetra3():
             num_entries = sum(1 for _ in open(catalog_file_full_pathname))
 
         self._logger.info('Loading catalogue ' + str(star_catalog) + ' with ' + str(num_entries) \
-             + ' star entries.') 
+             + ' star entries.')
 
         # Preallocate star table:
         star_table = np.zeros((num_entries, 6), dtype=np.float32)
         # Preallocate ID table
-        if star_catalog == 'bsc5':
+        if star_catalog.startswith('bsc5'):
             star_catID = np.zeros(num_entries, dtype=np.uint16)
         elif star_catalog == 'hip_main':
             star_catID = np.zeros(num_entries, dtype=np.uint32)
@@ -720,7 +757,6 @@ class Tetra3():
                 if header["STNUM"] < 0:
                     bsc5_format.append(("NAME", f"S{-header['STNUM']}"))
                 bsc5_data_type = np.dtype(bsc5_format)
-                self._logger.debug(f"constructed dtype: {bsc5_data_type}")
                 assert header["NBENT"] == bsc5_data_type.itemsize, \
                                           ("dtype construction problem: header claims "
                                            f"{header['NBENT']}B per entry, dtype itemsize"
@@ -736,6 +772,17 @@ class Tetra3():
                 star_table[mag<=star_max_magnitude, 1] = dec.squeeze()[mag<=star_max_magnitude]
                 star_table[mag<=star_max_magnitude, 5] = mag[mag<=star_max_magnitude]
                 star_catID[mag<=star_max_magnitude] = reader["XNO"].squeeze()[mag<=star_max_magnitude]
+        elif star_catalog == "bsc5_ascii":
+            arr = np.genfromtxt(catalog_file_full_pathname, names=field_names, deletechars=" ",
+                                delimiter=field_widths, dtype=field_types)
+            mag = arr["Vmag"]
+            ra = arr["RAh"]*360./24 + arr["RAm"]*60./24 + arr["RAs"]/24
+            ra += arr["pmRA"] * (current_year - 2000.0)
+            dec = arr["DEd"] + arr["DEm"]/60. + arr["DEs"]/3600.
+            dec *= np.where(arr["DE-"]=="-", -1, 1) # TODO: fix
+            dec += arr["pmDE"] * (current_year - 2000.0)
+            star_table[:, 0] = ra; star_table[:, 1] = dec; star_table[:, 2:5] = 0; star_table[:, 5] = mag
+            star_catID[:] = arr["HR"]
         elif star_catalog in ('hip_main', 'tyc_main'):
             incomplete_entries = 0
             with open(catalog_file_full_pathname, 'r') as star_catalog_file:
@@ -770,10 +817,10 @@ class Tetra3():
         star_table = star_table[brightness_ii, :]  # Sort by brightness
         num_entries = star_table.shape[0]
         # Trim and order catalogue ID array to match
-        if star_catalog in ('bsc5', 'hip_main'):
-            star_catID = star_catID[kept][brightness_ii]
-        else:
+        if star_catalog == "tyc_main":
             star_catID = star_catID[kept, :][brightness_ii, :]
+        else:
+            star_catID = star_catID[kept][brightness_ii]
         self._logger.info('Loaded ' + str(num_entries) + ' stars with magnitude below ' \
             + str(star_max_magnitude) + '.')
 
@@ -925,10 +972,11 @@ class Tetra3():
         pattern_index = (np.cumsum(keep_for_verifying)-1)
         pattern_list = pattern_index[np.array(list(pattern_list))].tolist()
         # Trim catalogue ID to match
-        if star_catalog in ('bsc5', 'hip_main'):
-            star_catID = star_catID[keep_for_verifying]
-        else:
+        if star_catalog == "tyc_main":
             star_catID = star_catID[keep_for_verifying, :]
+        else:
+            star_catID = star_catID[keep_for_verifying]
+        
 
         # Create all pattens by calculating and sorting edge ratios and inserting into hash table
         self._logger.info('Start building catalogue.')
